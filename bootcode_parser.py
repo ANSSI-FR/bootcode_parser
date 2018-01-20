@@ -11,6 +11,25 @@ import os
 import capstone
 import capstone.x86
 import sys
+from construct import ConstructError, Adapter, Struct, Sequence, Array, \
+    Int8ul, Int8ub, Int16ul, Int32ul, Int64ul, Int8sl, \
+    Bytes, \
+    Enum, String, Octet, BitsInteger, BitStruct, Padding, this, Pass, Const, Embedded
+from array import array
+
+
+class _Utf16(Adapter):
+    def _decode(self, obj, context):
+        return array('B', obj[1]).tostring().decode('utf16').strip('\x00')
+
+
+def PascalUtf16(size_type=Int16ul):
+    """Parse a length-defined string in UTF-16."""
+
+    return _Utf16(Sequence(
+        size_type,
+        Bytes(this[0] * 2),
+    ))
 
 
 BOOTRECORD_WHITELIST_PATH = os.path.join(os.path.dirname(__file__), 'data', 'bootrecord_whitelist.csv')
@@ -19,7 +38,7 @@ BOOTRECORD_WHITELIST_PATH = os.path.join(os.path.dirname(__file__), 'data', 'boo
 class BootRecord(object):
     __metaclass__ = ABCMeta
 
-    def __init__(self, fileObject, size, offset=None, whitelist=()):
+    def __init__(self, source, size, offset=None, whitelist=()):
         """
             Default constructor which loads the raw data from a file.
             No sanity check is performed on the size or existence of the file.
@@ -35,13 +54,26 @@ class BootRecord(object):
         self._oemId = None
 
         self._whitelist = whitelist
-        self._sample = fileObject.name
         self._offset = offset
 
-        self._logger = logging.LoggerAdapter(logging.getLogger(__file__),
-                                             {'objectid': self._sample, 'stage': self._type})
+        # Input may be a file object, a list of file paths or directly the raw data (str)
+        if isinstance(source, file):
+            self._sample = source.name
+            self._raw = source.read(size)
+        elif isinstance(source, (list, tuple)):
+            self._sample = ', '.join(source)
+            self._raw = str()
+            for f in source:
+                with open(f, 'rb') as f_data:
+                    self._raw += f_data.read()
+        elif isinstance(source, str):
+            self._sample = None
+            self._raw = source
+        else:
+            raise InvalidBootRecordError('Cannot instantiate a BootRecord object from {0}'.format(type(source)))
 
-        self._raw = fileObject.read(size)
+        self._logger = logging.LoggerAdapter(logging.getLogger('artefact'),
+                                             {'objectid': getattr(self, '_sample', None), 'stage': self._type})
         self._parse()
 
     def __eq__(self, other):
@@ -122,45 +154,46 @@ class BootRecord(object):
 
 
 class MasterBootRecord(BootRecord):
-    _MBR_STRUCT = construct.Struct("mbr",
-                                   construct.HexDumpAdapter(construct.Bytes("bootloader_code", 440)),
-                                   construct.Field('disk_signature', 4),
-                                   construct.Padding(2),
-                                   construct.Array(4,
-                                                   construct.Struct("partitions",
-                                                                    construct.SLInt8("state"),
-                                                                    construct.BitStruct("beginning",
-                                                                                        construct.Octet("head"),
-                                                                                        construct.Bits("sect", 6),
-                                                                                        construct.Bits("cyl", 10),
-                                                                                        ),
-                                                                    construct.Enum(construct.UBInt8("type"),
-                                                                                   Nothing=0x00,
-                                                                                   FAT12=0x01,
-                                                                                   XENIX_ROOT=0x02,
-                                                                                   XENIX_USR=0x03,
-                                                                                   FAT16_old=0x04,
-                                                                                   Extended_DOS=0x05,
-                                                                                   FAT16=0x06,
-                                                                                   FAT32=0x0b,
-                                                                                   FAT32_LBA=0x0c,
-                                                                                   NTFS=0x07,
-                                                                                   LINUX_SWAP=0x82,
-                                                                                   LINUX_NATIVE=0x83,
-                                                                                   PROTECTIVE_MBR=0xee,
-                                                                                   _default_=construct.Pass,
-                                                                                   ),
-                                                                    construct.BitStruct("ending",
-                                                                                        construct.Octet("head"),
-                                                                                        construct.Bits("sect", 6),
-                                                                                        construct.Bits("cyl", 10),
-                                                                                        ),
-                                                                    construct.ULInt32("sector_offset"), # offset from MBR in sectors
-                                                                    construct.ULInt32("size"),  # in sectors
-                                                                    )
-                                                   ),
-                                   construct.Const(construct.Bytes("signature", 2), '55aa'.decode('hex')),
-                                   )
+    _MBR_STRUCT = Struct(
+        'bootloader_code' / Bytes(440),
+        'disk_signature' / Bytes(4),
+        Padding(2),
+        'partitions' / Array(
+            4,
+            Struct(
+                'state' / Int8sl,
+                'beginning' / BitStruct(
+                    'head' / Octet,
+                    'sect' / BitsInteger(6),
+                    'cyl' / BitsInteger(10),
+                ),
+                Enum('type' / Int8ub,
+                     Nothing=0x00,
+                     FAT12=0x01,
+                     XENIX_ROOT=0x02,
+                     XENIX_USR=0x03,
+                     FAT16_old=0x04,
+                     Extended_DOS=0x05,
+                     FAT16=0x06,
+                     FAT32=0x0b,
+                     FAT32_LBA=0x0c,
+                     NTFS=0x07,
+                     LINUX_SWAP=0x82,
+                     LINUX_NATIVE=0x83,
+                     PROTECTIVE_MBR=0xee,
+                     _default_=Pass,
+                     ),
+                'ending' / BitStruct(
+                    'head' / Octet,
+                    'sect' / BitsInteger(6),
+                    'cyl' / BitsInteger(10),
+                ),
+                'sector_offset' / Int32ul, # offset from MBR in sectors
+                'size' / Int32ul,  # in sectors
+            )
+        ),
+        Const('55aa'.decode('hex')),
+    )
 
     def __init__(self, filePath, size, offset=None, whitelist=()):
         self._type = 'MBR'
@@ -179,7 +212,7 @@ class MasterBootRecord(BootRecord):
         """
         try:
             mbr = self._MBR_STRUCT.parse(self._raw)
-        except construct.core.ConstructError as e:
+        except ConstructError as e:
             raise InvalidMBRError('Invalid MBR structure: {0}\n{1}'.format(e, hexdump(self._raw)))
 
         self._parsePartTable(mbr.partitions)
@@ -220,13 +253,21 @@ class MasterBootRecord(BootRecord):
             partNum += 1
             # Assume a partition entry without size (in LBA) or type is invalid, and do not include it in the listing.
             if part.size != 0 and part.type != 'Nothing':
-                self._partTable.append((partNum, part.state < 0, part.type, part.sector_offset, part.size))
+                dPart = {
+                    'Number': partNum,
+                    'Attributes': 'Active' if part.state < 0 else 'Inactive',
+                    'Type': part.type,
+                    'Start sector': part.sector_offset,
+                    'Size in sectors': part.size
+                }
+                self._partTable.append(dPart)
             else:
-                self._logger.debug('Ignoring invalid partition: %s', part)
-            # Early detection of protective MBR so that we don't try to make sense of the MBR partition table
+                self._logger.debug('Ignoring invalid partition: %s', repr(part))
+            # Protective MBR is just informative, keep on parsing partition table in case there is a valid
+            # active partition
             if part.type == 'PROTECTIVE_MBR' and partNum == 1:
                 self._logger.debug('Protective MBR detected, MBR partition table should not be taken into account. '
-                                   'GPT partition table parser not implemented yet')
+                                   'Look for the GPT table partition instead')
                 self._signature.append('Protective MBR')
 
     def _getInvariantCode(self, rawCode):
@@ -301,7 +342,7 @@ class MasterBootRecord(BootRecord):
             # Eg: The first localized string is at : 0x100 + the value saved at offset 0x1B5
             # Even though localized strings can be of different lengths, the offset of the first one does not vary
             # given one Windows version. This can therefore be used to tell Windows versions apart.
-            firstStrOffset = construct.UBInt8('FirstStringOffset').parse(rawCode[0x1b5])
+            firstStrOffset = Int8ub.parse(rawCode[0x1b5])
             # Windows NT5
             if firstStrOffset == 0x2c:
                 expectedLoader = 'NT5.1/NT5.2 MBR'
@@ -356,81 +397,77 @@ class MasterBootRecord(BootRecord):
 
 
 class VolumeBootRecord(BootRecord):
-    _NTFS_VBR_STRUCT = construct.Struct('NTFS-VBR',
-                                        construct.Field('JumpOverBPB', 3),
-                                        construct.String("OemId", 8),
-                                        construct.Struct('BiosParameterBlock',
-                                                         construct.ULInt16('SectorSize'),
-                                                         construct.ULInt8('SectorsPerCluster'),
-                                                         construct.Field('Reserved1', 2),
-                                                         construct.Field('MustBeZero1', 3),
-                                                         construct.Field('MustBeZero2', 2),
-                                                         construct.ULInt8('MediaDescriptor'),
-                                                         construct.Field('MustBeZero3', 2),
-                                                         construct.ULInt16('SectorsPerTrack'),
-                                                         construct.ULInt16('NumberOfHeads'),
-                                                         construct.ULInt32('HiddenSectors'),
-                                                         construct.Field('NotUsed1', 4),
-                                                         construct.Const(construct.Field('DriveNumber', 1),
-                                                                         '80'.decode('hex')),
-                                                         construct.Field('Reserved2', 3),
-                                                         construct.ULInt64('TotalSectors'),
-                                                         construct.ULInt64('MFTCluster'),
-                                                         construct.ULInt64('MFTMirrCluster'),
-                                                         construct.SLInt8('ClustersPerMFTRecord'),
-                                                         construct.Field('NotUsed2', 3),
-                                                         construct.SLInt8('ClustersPerIdxBuffer'),
-                                                         construct.Field('NotUsed3', 3),
-                                                         construct.ULInt64('VolumneSN'),
-                                                         construct.Field('NotUsed4', 4),
-                                                         ),
-                                        construct.HexDumpAdapter(construct.Bytes("Code", 426)),
-                                        construct.Const(construct.Bytes("signature", 2), '55aa'.decode('hex')),
-                                        )
+    _NTFS_VBR_STRUCT = Struct(
+        'JumpOverBPB' / Bytes(3),
+        'OemId' / String( 8),
+        'BiosParameterBlock' / Struct(
+            'SectorSize' / Int16ul,
+            'SectorsPerCluster' / Int8ul,
+            'Reserved1' / Bytes(2),
+            'MustBeZero1' / Bytes(3),
+            'MustBeZero2' / Bytes(2),
+            'MediaDescriptor' / Int8ul,
+            'MustBeZero3' / Bytes(2),
+            'SectorsPerTrack' / Int16ul,
+            'NumberOfHeads' / Int16ul,
+            'HiddenSectors' / Int32ul,
+            'NotUsed1' / Bytes(4),
+            'DriveNumber' / Const('80'.decode('hex')),
+            'Reserved2' / Bytes(3),
+            'TotalSectors' / Int64ul,
+            'MFTCluster' / Int64ul,
+            'MFTMirrCluster' / Int64ul,
+            'ClustersPerMFTRecord' / Int8sl,
+            'NotUsed2' / Bytes(3),
+            'ClustersPerIdxBuffer' / Int8sl,
+            'NotUsed3' / Bytes(3),
+            'VolumneSN' / Int64ul,
+            'NotUsed4' / Bytes(4),
+        ),
+        'Code' / Bytes( 426),
+        Const('55aa'.decode('hex')),
+    )
 
-    _BITLOCKER_VBR_STRUCT = construct.Struct('FVE-VBR',
-                                             construct.Field('JumpOverBPB', 3),
-                                             construct.Const(construct.String("OemId", 8), '-FVE-FS-'.encode('utf8')),
-                                             construct.Struct('BiosParameterBlock',
-                                                              construct.ULInt16('SectorSize'),
-                                                              construct.ULInt8('SectorsPerCluster'),
-                                                              construct.Field('Reserved1', 2),
-                                                              construct.Field('MustBeZero1', 3),
-                                                              construct.Field('MustBeZero2', 2),
-                                                              construct.ULInt8('MediaDescriptor'),
-                                                              construct.Field('MustBeZero3', 2),
-                                                              construct.ULInt16('SectorsPerTrack'),
-                                                              construct.ULInt16('NumberOfHeads'),
-                                                              construct.ULInt32('HiddenSectors'),
-                                                              construct.ULInt32('TotalSectors'),
-                                                              construct.ULInt32('SectorsPerFAT'),
-                                                              construct.ULInt16('FATFlags'),
-                                                              construct.ULInt16('Version'),
-                                                              construct.ULInt32('RootDirCluster'),
-                                                              construct.ULInt16('FSInfoSector'),
-                                                              construct.ULInt16('BackupSector'),
-                                                              construct.Field('Reserved2', 12),
-                                                              construct.Const(construct.Field('DriveNumber', 1),
-                                                                              '80'.decode('hex')),
-                                                              construct.Field('Reserved3', 1),
-                                                              construct.Field('ExtendedBootSignature', 1),
-                                                              construct.ULInt32('VolumneSN'),
-                                                              construct.Const(construct.String("VolumeLabel", 11),
-                                                                              'NO NAME    '.encode('utf8')),
-                                                              construct.Const(construct.String("SystemId", 8),
-                                                                              'FAT32   '.encode('utf8')),
-                                                              ),
-                                             construct.HexDumpAdapter(construct.Bytes("Code1", 70)),
-                                             construct.Field('BitlockerGUID', 16),
-                                             construct.ULInt64('FVEMetadataBlockOffset1'),
-                                             construct.ULInt64('FVEMetadataBlockOffset2'),
-                                             construct.ULInt64('FVEMetadataBlockOffset3'),
-                                             construct.HexDumpAdapter(construct.Bytes("Code2", 307)),
-                                             construct.ULInt8('FirstStrOffset'),
-                                             construct.ULInt8('SecondStrOffset'),
-                                             construct.ULInt8('ThirdStrOffset'),
-                                             construct.Const(construct.Bytes("signature", 2), '55aa'.decode('hex')),
-                                             )
+    _BITLOCKER_VBR_STRUCT = Struct(
+        'JumpOverBPB' / Bytes(3),
+        'OemId' / Const('-FVE-FS-'.encode('utf8')),
+        'BiosParameterBlock' / Struct(
+            'SectorSize' / Int16ul,
+            'SectorsPerCluster' / Int8ul,
+            'Reserved1' / Bytes(2),
+            'MustBeZero1' / Bytes(3),
+            'MustBeZero2' / Bytes(2),
+            'MediaDescriptor' / Int8ul,
+            'MustBeZero3' / Bytes(2),
+            'SectorsPerTrack' / Int16ul,
+            'NumberOfHeads' / Int16ul,
+            'HiddenSectors' / Int32ul,
+            'TotalSectors' / Int32ul,
+            'SectorsPerFAT' / Int32ul,
+            'FATFlags' / Int16ul,
+            'Version' / Int16ul,
+            'RootDirCluster' / Int32ul,
+            'FSInfoSector' / Int16ul,
+            'BackupSector' / Int16ul,
+            'Reserved2' / Bytes(12),
+            'DriveNumber' / Const('80'.decode('hex')),
+            'Reserved3' / Bytes(1),
+            'ExtendedBootSignature' / Bytes(1),
+            'VolumneSN' / Int32ul,
+            'VolumeLabel' / Const('NO NAME    '.encode('utf8')),
+            'SystemId' / Const('FAT32   '.encode('utf8')),
+        ),
+        'Code1' / Bytes(70),
+        'BitlockerGUID' / Bytes(16),
+        'FVEMetadataBlockOffset1' / Int64ul,
+        'FVEMetadataBlockOffset2' / Int64ul,
+        'FVEMetadataBlockOffset3' / Int64ul,
+        'Code2' / Bytes(307),
+        'FirstStrOffset' / Int8ul,
+        'SecondStrOffset' / Int8ul,
+        'ThirdStrOffset' / Int8ul,
+        Const('55aa'.decode('hex')),
+    )
 
     def __init__(self, filePath, size, offset=None, whitelist=()):
         self._type = 'VBR'
@@ -451,12 +488,12 @@ class VolumeBootRecord(BootRecord):
             # This will parse both NTFS and Vista bitlocker volumes since they only differ by their OEM ID
             vbr = self._NTFS_VBR_STRUCT.parse(self._raw)
             expectedLoader, invariantCode = self._getInvariantCode('NTFS', vbr)
-        except construct.core.ConstructError as e1:
+        except ConstructError as e1:
             # Retry with Bitlocker (Win7+) volume header structure
             try:
                 vbr = self._BITLOCKER_VBR_STRUCT.parse(self._raw)
                 expectedLoader, invariantCode = self._getInvariantCode('bitlocker', vbr)
-            except construct.core.ConstructError as e2:
+            except ConstructError as e2:
                 raise InvalidVBRError('Invalid VBR structure: e1={0}, e2={1}\n{2}'.format(e1, e2, hexdump(self._raw)))
 
         self._oemId = vbr.OemId
@@ -509,7 +546,7 @@ class VolumeBootRecord(BootRecord):
             # Since there is no easy way to tell which version of Windows we are dealing with beforehand, we first
             # assume it is a Windows < 8 by testing 0x1f8 against all the known first offset. If all tests fail, assume
             # it is Windows >= 8 and check 0x1f6 against the only known first offset (to date)
-            firstStrOffset = construct.UBInt8('FirstStringOffset').parse(self._raw[0x1f8])
+            firstStrOffset = Int8ub.parse(self._raw[0x1f8])
             # Windows NT5
             if firstStrOffset == 0x83:
                 expectedLoader = 'NT5.1/NT5.2 VBR'
@@ -524,7 +561,7 @@ class VolumeBootRecord(BootRecord):
                 codeEnd = 0x100 + firstStrOffset
             # Windows NT6.2+
             else:
-                firstStrOffset = construct.ULInt16('FirstStringOffset').parse(self._raw[0x1f6:0x1f8])
+                firstStrOffset = Int16ul.parse(self._raw[0x1f6:0x1f8])
                 if firstStrOffset == 0x18a:
                     expectedLoader = 'NT6.2+ VBR'
                     codeEnd = firstStrOffset
@@ -569,10 +606,6 @@ class VolumeBootRecord(BootRecord):
 
 
 class InitialProgramLoader(BootRecord):
-    _IPL_HEADER = construct.Struct('IPL_HEADER',
-                                   construct.ULInt16('sig_len'),
-                                   construct.String('signature', length=lambda ctx: ctx.sig_len * 2,
-                                                    encoding='utf16'.encode('utf8')))
 
     def __init__(self, filePath, size, offset=None, whitelist=()):
         self._type = 'IPL'
@@ -580,8 +613,8 @@ class InitialProgramLoader(BootRecord):
 
     def _parse(self):
         try:
-            header = self._IPL_HEADER.parse(self._raw)
-        except (construct.ConstructError, UnicodeDecodeError) as e:
+            header = PascalUtf16(Int16ul).parse(self._raw)
+        except (ConstructError, UnicodeDecodeError) as e:
             raise InvalidIPLError('Invalid IPL structure: {0}\n{1}'.format(e, hexdump(self._raw[:0x200])))
 
         try:
@@ -598,12 +631,12 @@ class InitialProgramLoader(BootRecord):
         # Starting with NT 6.2, IPL has a localized string that must be excluded from hash computation.
         # The difference between these two kinds of IPL can be told from the instruction located at 0x56 :
         # a Jump Short (EB) in case of IPL<6.2 or a Jump Near (E9) otherwise
-        if header.signature == 'BOOTMGR' and self._raw[0x56].encode('hex').upper() == 'E9':
+        if header == 'BOOTMGR' and self._raw[0x56].encode('hex').upper() == 'E9':
             # The offset of the localized string seems to be stored in a DWORD at 0x117 (just before the beginning
             # of the assembly code). But the value seems to be an offset relative to the start of the whole
             # boot record (including the VBR) and not just the IPL.
             # Therefore we need to substract 0x200 to get the offset inside the IPL.
-            strOffset = construct.ULInt16('offset').parse(self._raw[0x117:]) - 0x200
+            strOffset = Int16ul.parse(self._raw[0x117:]) - 0x200
             # Exclude from hash calculation everything between the string offset and the beginning of code
             invariantCode = invariantCode[:strOffset] + invariantCode[0x119:]
             expectedLoader = 'NT6.2+ IPL'
@@ -728,7 +761,7 @@ def parseBootRecord(brType, input, offset, whitelist):
         elif brType == 'VBR':
             objBr = VolumeBootRecord(input, 512, offset=offset, whitelist=whitelist)
         elif brType == 'IPL':
-            objBr = InitialProgramLoader(input, 15*512, whitelist=whitelist)
+            objBr = InitialProgramLoader(input, 15 * 512, whitelist=whitelist)
         else:
             return
         checkResult(objBr, brType)
@@ -741,23 +774,25 @@ def parseImageFile(input, sectorSize, whitelist):
     try:
         objMBR = MasterBootRecord(input, sectorSize, 0, whitelist)
         checkResult(objMBR, 'MBR')
-        activePart = []
+        activePart = {}
         for part in getattr(objMBR, '_partTable'):
-            # A partition is a tuple: (number, state, type, sector_offset, size)
-            if part[1]:
+            # A partition is a dict with the following keys: (Number, Attributes, Type, Start sector, Size in sectors,
+            # Name)
+            if 'Active' in part['Attributes']:
                 activePart = part
                 # The first active partition is the one the MBR will load the VBR from
                 break
         logger.extra.update({'stage': 'IMG'})
         if activePart:
-            logger.debug('Found active partition n°%d starting at sector %d', activePart[0], activePart[3])
-            offset = activePart[3]*sectorSize
+            logger.debug('Found active partition n°%d starting at sector %d',
+                         activePart['Number'], activePart['Start sector'])
+            offset = activePart['Start sector'] * sectorSize
             input.seek(offset)
             objVBR = VolumeBootRecord(input, sectorSize, offset=offset, whitelist=whitelist)
             if not checkResult(objVBR, 'VBR'):
                 logger.warning('VBR of the active partition located at sector %d (offset %d) is suspicious (see '
                                'previous warning). This could mean that the partition table in the MBR or the BPB in '
-                               'the VBR has been tampered with !', activePart[3], offset)
+                               'the VBR has been tampered with !', activePart['Start sector'], offset)
             hiddenSectors = getattr(objVBR, '_bpb').HiddenSectors
             logger.extra.update({'stage': 'IMG'})
             logger.debug('Found HiddenSectors value: %d', hiddenSectors)

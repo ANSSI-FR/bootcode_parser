@@ -64,7 +64,7 @@ def test_img_gapz_with_whitelist(caplog, whitelist):
     caplog.set_level(logging.INFO)
     with open(sampleName, 'rb') as f_img:
         parseImageFile(f_img, sectorSize=512, whitelist=whitelist)
-    assert caplog.record_tuples == [
+    assert caplog.record_tuples[:-1] == [
         (bootcode_parser.__file__, logging.INFO, "Known signatures found: ['NT6.1+ MBR']"),
         (bootcode_parser.__file__, logging.INFO, "Known signatures found: ['NT6.1 VBR']"),
         (bootcode_parser.__file__, logging.WARNING, "Suspicious behaviours were detected: [u'Suspicious HiddenSectors "
@@ -76,8 +76,10 @@ def test_img_gapz_with_whitelist(caplog, whitelist):
         (bootcode_parser.__file__, logging.WARNING, "HiddenSectors value in BiosParameterBlock is different than actual"
                                                     " offset in partition table ! HiddenSectors=209714414, partition"
                                                     " table offset=2048"),
-        (bootcode_parser.__file__, logging.ERROR, "Invalid IPL structure: expected 2, found 0\n")
     ]
+    name, level, msg = caplog.record_tuples[-1]
+    assert (name, level) == (bootcode_parser.__file__, logging.ERROR)
+    assert msg.startswith("Invalid IPL structure:")
 
 
 def test_img_rovnix_with_whitelist(caplog, whitelist):
