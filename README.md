@@ -35,7 +35,7 @@ How to interpret the results ?
 Dependencies
 ============
 * python2 >= 2.7
-* python-construct >= 2.8
+* python-construct == 2.8
 * python-capstone >= 3.0.4
 
 Usage
