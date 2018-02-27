@@ -1,21 +1,31 @@
 #!/usr/bin/env python2
 # -*- coding:utf-8 -*-
 
-from __future__ import unicode_literals
+from __future__ import unicode_literals, print_function
 from abc import ABCMeta, abstractmethod
 import logging
 import hashlib
-import construct
 import csv
 import os
 import capstone
 import capstone.x86
 import sys
-from construct import ConstructError, Adapter, Struct, Sequence, Array, \
-    Int8ul, Int8ub, Int16ul, Int32ul, Int64ul, Int8sl, \
-    Bytes, \
-    Enum, String, Octet, BitsInteger, BitStruct, Padding, this, Pass, Const, Embedded
 from array import array
+try:
+    from construct import ConstructError, Adapter, Struct, Sequence, Array, \
+        Int8ul, Int8ub, Int16ul, Int32ul, Int64ul, Int8sl, Bytes, \
+        Enum, String, Octet, BitsInteger, BitStruct, Padding, this, Pass, Const, \
+        version as construct_version
+    if construct_version[:2] != (2, 8):
+        print('This version of {0} is compatible with Construct v2.8 only (you have v{1}.{2}).'
+              .format(__file__, construct_version[0], construct_version[1]))
+        sys.exit(1)
+except ImportError:
+    print('This version of {0} is compatible with Construct v2.8.x only. '
+          'You either don\'t have the right version of Construct or don\'t have Construct at all.'
+          .format(__file__))
+    sys.exit(1)
+
 
 
 class _Utf16(Adapter):
