@@ -1,3 +1,5 @@
+:warning: **This project is in maintenance mode: issues and PRs will still be addressed, but no further development will be made.** :warning:
+
 bootcode_parser
 =================
 ```bootcode_parser.py``` is a Python script designed to perform a quick offline analysis of the boot records used by BIOS based systems (UEFI is *not* supported).
